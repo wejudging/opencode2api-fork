@@ -566,6 +566,9 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 		}
 		request.ToolChoice = decodeAnthropicToolChoice(input["tool_choice"])
 
+	case Google:
+		return decodeGoogleRequest(input)
+
 	default:
 		return request, fmt.Errorf("unsupported input protocol %q", protocol)
 	}
@@ -622,6 +625,8 @@ func encodeBridgeRequest(protocol Protocol, request bridgeRequest) (map[string]a
 		return encodeResponsesRequest(request), nil
 	case Anthropic:
 		return encodeAnthropicRequest(request), nil
+	case Google:
+		return encodeGoogleRequest(request)
 	default:
 		return nil, fmt.Errorf("unsupported output protocol %q", protocol)
 	}

@@ -21,7 +21,7 @@ type bridgeStreamParser struct {
 
 func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamEvent, error) {
 	if data == "[DONE]" {
-		if parser.protocol != Chat {
+		if parser.protocol != Chat && parser.protocol != Google {
 			return nil, fmt.Errorf("unexpected [DONE] terminator for %s stream", parser.protocol)
 		}
 		return []bridgeStreamEvent{{Kind: "done"}}, nil
@@ -37,6 +37,8 @@ func (parser *bridgeStreamParser) Parse(eventName, data string) ([]bridgeStreamE
 		return parser.parseAnthropicEvent(eventName, value)
 	case Responses:
 		return parser.parseResponses(eventName, value), nil
+	case Google:
+		return parser.parseGoogleEvent(value), nil
 	default:
 		return nil, fmt.Errorf("unsupported stream protocol %q", parser.protocol)
 	}

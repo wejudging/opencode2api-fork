@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -869,7 +870,31 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 
 func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Protocol, body []byte, ids identity.RequestIDs, key string) (*http.Request, error) {
 	endpoint := strings.TrimRight(baseURL, "/") + wire.Path(protocol)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	sendBody := body
+	if protocol == wire.Google {
+		// generateContent carries the model in the URL and uses a different
+		// verb for streaming, so the endpoint cannot be derived from the
+		// protocol alone. The internal body still carries model/stream (the
+		// bridge sets them); strip them here so the provider never sees them.
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return nil, errors.New("google request body is not a JSON object")
+		}
+		model := jsonutil.StringAt(payload, "model")
+		if model == "" {
+			return nil, errors.New("google request is missing a model")
+		}
+		stream := jsonutil.BoolAt(payload, "stream")
+		delete(payload, "model")
+		delete(payload, "stream")
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, errors.New("google request body is not encodable")
+		}
+		sendBody = encoded
+		endpoint = googleEndpoint(baseURL, model, stream)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(sendBody))
 	if err != nil {
 		return nil, err
 	}
@@ -908,7 +933,31 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Proto
 		// case-sensitive: "Bearer PUBLIC" 401s.
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
+	if protocol == wire.Google {
+		// generateContent accepts the key as x-goog-api-key; send it alongside
+		// the bearer token so either gate accepts the request.
+		req.Header.Set("x-goog-api-key", key)
+	}
 	return req, nil
+}
+
+// googleEndpoint renders the model-and-stream specific generateContent URL.
+func googleEndpoint(baseURL, model string, stream bool) string {
+	action := ":generateContent"
+	if stream {
+		action = ":streamGenerateContent?alt=sse"
+	}
+	return strings.TrimRight(googleBaseURL(baseURL), "/") + "/v1/models/" + url.PathEscape(model) + action
+}
+
+// googleBaseURL maps the OpenAI-compatible tier base (…/zen and …/zen/go) onto
+// the native provider host (…/inference and …/inference/go) that serves the
+// generateContent routes.
+func googleBaseURL(baseURL string) string {
+	if index := strings.Index(baseURL, "/zen"); index >= 0 {
+		return baseURL[:index] + "/inference" + baseURL[index+len("/zen"):]
+	}
+	return strings.TrimRight(baseURL, "/")
 }
 
 // clientProjectID renders the project header the way the client does: a bare

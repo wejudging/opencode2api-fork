@@ -253,6 +253,8 @@ func protocolForSDK(npm string) (wire.Protocol, bool) {
 	switch {
 	case strings.Contains(value, "anthropic"):
 		return wire.Anthropic, true
+	case strings.Contains(value, "google"):
+		return wire.Google, true
 	case value == "@ai-sdk/openai" || strings.HasSuffix(value, "/openai"):
 		return wire.Responses, true
 	case strings.Contains(value, "openai-compatible"):
