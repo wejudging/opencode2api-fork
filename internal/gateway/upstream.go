@@ -256,10 +256,16 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	return nil, effectiveRoute, attempts, lastErr
 }
 
+// anonymousQuotaRetryAfter is the Retry-After threshold above which an
+// anonymous 429 is treated as an exit-IP quota window rather than a transient
+// per-second throttle. Past it the anonymous sweep stops early.
+const anonymousQuotaRetryAfter = time.Hour
+
 // doAnonymousUpstream tries every currently available proxy at most once. Any
 // failure, including an HTTP error response, advances to the next proxy. Only a
 // successful response ends the anonymous phase; exhausting the proxy cursor
-// returns control to the preferred authenticated tiers.
+// returns control to the preferred authenticated tiers. An exit-IP quota window
+// (429 with an hour-scale Retry-After) stops the sweep immediately.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
@@ -329,6 +335,14 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
 		} else {
 			g.logger.Debug("anonymous upstream returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+		}
+		// A free-tier quota answer carries a Retry-After measured in hours and
+		// is scoped to the exit IP, so every configured exit resets in the same
+		// window. Sweeping the remaining proxies only re-sends the same
+		// rate-limit (observed as 8-11 identical 429s per request); stop here
+		// and let the key tiers and the client's Retry-After backoff take over.
+		if resp.StatusCode == http.StatusTooManyRequests && parseRetryAfter(resp.Header.Get("Retry-After")) >= anonymousQuotaRetryAfter {
+			break
 		}
 	}
 	if lastResponse != nil {
@@ -673,6 +687,13 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		baseURL = g.cfg.Upstream.Go
 	}
 	cursor := nodes.CursorFor(ids.Session)
+	if g.catalog.IsFreeModel(route.ID) {
+		// A free-tier quota is scoped to the exit IP and every key is bound to
+		// its own proxy, so pinning free-model traffic to one session key
+		// exhausts a single exit while the rest sit idle. Rotate instead so the
+		// per-IP allowance is drawn down evenly.
+		cursor = nodes.Cursor()
+	}
 	if nodes.Len() == 0 {
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0
 	}

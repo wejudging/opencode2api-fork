@@ -507,6 +507,15 @@ func (p *nodePool) MarkSuccess(node *upstreamNode) {
 	node.cooldownUntil.Store(0)
 }
 
+// maxKeyRetryAfterMultiplier bounds how long an upstream Retry-After may cool a
+// key, mirroring the anonymous lane's 8x ceiling. OpenCode's free tier answers
+// with Retry-After until the next quota reset (tens of thousands of seconds)
+// and that quota is scoped to the exit IP, not the key. Honoring such a value
+// in full removed the key from the pool for the rest of the day, so a free
+// request also took the key away from paid models that share the pool. The
+// cap keeps the failover signal without the day-long lockout.
+const maxKeyRetryAfterMultiplier = 8
+
 func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err error) {
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 		return
@@ -516,7 +525,7 @@ func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err erro
 	delay := p.cooldown * multiplier
 	if resp != nil {
 		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > delay {
-			delay = retryAfter
+			delay = min(retryAfter, p.cooldown*maxKeyRetryAfterMultiplier)
 		}
 	}
 	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
