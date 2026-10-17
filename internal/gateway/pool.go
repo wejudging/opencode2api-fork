@@ -196,11 +196,24 @@ func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 // recovers first.
 const maxAnonymousRetryAfterMultiplier = 8
 
+// blockedExitCooldown sidelines an anonymous exit whose egress IP the free
+// tier rejects with 403. The rejection is exit-specific (the identical shaped
+// request succeeds through other exits on both the legacy /zen/v1 and the
+// /inference lane) and persists across the normal cooldown window, so a short
+// cooldown only re-probed the flagged exits on every idle period and wasted
+// two attempts per exit before reaching a working one.
+const blockedExitCooldown = 12 * time.Hour
+
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
 	if node == nil || (node.proxy != nil && node.proxy.pool) {
 		return
 	}
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+		return
+	}
+	if resp != nil && resp.StatusCode == http.StatusForbidden {
+		node.failures.Store(0)
+		node.cooldownUntil.Store(time.Now().Add(blockedExitCooldown).UnixNano())
 		return
 	}
 	failures := node.failures.Add(1)
