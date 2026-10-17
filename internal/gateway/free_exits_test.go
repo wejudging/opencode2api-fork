@@ -2,9 +2,11 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,6 +67,46 @@ func TestAnonymousCursorNeverBypassesCooldown(t *testing.T) {
 	cursor := g.anonymous.CursorFor("")
 	if cursor.Next() != nil {
 		t.Fatal("selected a cooling exit")
+	}
+}
+
+func TestFreeCooldownSurvivesClientProtocolAdapter(t *testing.T) {
+	for _, protocol := range []wire.Protocol{wire.Chat, wire.Responses, wire.Anthropic, wire.SystemOne} {
+		t.Run(string(protocol), func(t *testing.T) {
+			resp := freeCooldownResponse(30 * time.Second)
+			defer resp.Body.Close()
+			w := httptest.NewRecorder()
+			copyErrorResponse(w, protocol, resp, "req-cooldown-test")
+			if w.Code != 429 || w.Header().Get("Retry-After") != "30" || w.Header().Get("x-request-id") != "req-cooldown-test" {
+				t.Fatalf("lost cooldown status/headers: %d %v", w.Code, w.Header())
+			}
+			var body struct {
+				Error struct{ Type, Code string }
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if protocol == wire.Anthropic {
+				if body.Error.Type != "free_exit_cooldown" {
+					t.Fatalf("lost Anthropic cooldown type: %s", w.Body)
+				}
+			} else if body.Error.Type != "rate_limit_error" || body.Error.Code != "free_exit_cooldown" {
+				t.Fatalf("lost OpenAI cooldown code: %s", w.Body)
+			}
+		})
+	}
+}
+
+func TestUnrelatedUpstreamErrorsKeepExistingContract(t *testing.T) {
+	for _, status := range []int{429, 500} {
+		resp := testResponse(status)
+		resp.Body = io.NopCloser(strings.NewReader(`{"error":{"message":"provider error","code":"provider_specific"}}`))
+		w := httptest.NewRecorder()
+		copyErrorResponse(w, wire.Chat, resp, "req-upstream-test")
+		resp.Body.Close()
+		if w.Code != status || !strings.Contains(w.Body.String(), `"type":"upstream_error"`) || strings.Contains(w.Body.String(), "provider_specific") {
+			t.Fatalf("changed upstream contract: %d %s", w.Code, w.Body)
+		}
 	}
 }
 func TestQuotaOnOneExitStillTriesOtherExit(t *testing.T) {

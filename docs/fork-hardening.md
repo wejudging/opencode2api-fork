@@ -32,7 +32,9 @@ account health. Do not restore the old earliest-expiry anonymous fallback.
   Rotating `#pool` entries opt out because one URL does not identify one exit.
   Quota buckets are conservatively model-scoped until broader sharing is proven.
 - If every considered free exit is cooling, return a local 429 with
-  `code=free_exit_cooldown` and Retry-After, with zero upstream attempts.
+  `code=free_exit_cooldown` (Anthropic: `error.type=free_exit_cooldown`) and
+  Retry-After, with zero upstream attempts. The client protocol adapter must
+  preserve this classification rather than replace it with `upstream_error`.
 - Corrupt/unreadable persisted restriction state fails startup explicitly;
   back it up before repair. Do not silently discard long bans on parse errors.
 

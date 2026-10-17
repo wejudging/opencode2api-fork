@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/httpx"
 	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
 	"opencode2api/internal/models"
@@ -517,6 +518,22 @@ func copyErrorResponse(w http.ResponseWriter, protocol wire.Protocol, resp *http
 	var value map[string]any
 	if json.Unmarshal(body, &value) == nil {
 		message = jsonutil.FirstString(jsonutil.StringAt(value, "error", "message"), jsonutil.StringAt(value, "message"), message)
+		// The local quota response passes through the same protocol adapter as
+		// provider failures. Preserve its known, actionable code without exposing
+		// arbitrary upstream error objects or changing other error contracts.
+		if resp.StatusCode == http.StatusTooManyRequests && jsonutil.StringAt(value, "error", "code") == "free_exit_cooldown" {
+			if protocol == wire.Anthropic {
+				wire.WriteError(w, protocol, resp.StatusCode, message, "free_exit_cooldown", requestID)
+			} else {
+				if requestID != "" {
+					w.Header().Set("x-request-id", requestID)
+				}
+				httpx.WriteJSONStatus(w, resp.StatusCode, map[string]any{"error": map[string]any{
+					"message": message, "type": "rate_limit_error", "param": nil, "code": "free_exit_cooldown",
+				}})
+			}
+			return
+		}
 	}
 	wire.WriteError(w, protocol, resp.StatusCode, message, "upstream_error", requestID)
 }
