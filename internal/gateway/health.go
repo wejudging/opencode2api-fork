@@ -13,13 +13,14 @@ import (
 )
 
 type healthResponse struct {
-	Status  string        `json:"status"`
-	Ready   bool          `json:"ready"`
-	Version string        `json:"version"`
-	Models  healthModels  `json:"models"`
-	Keys    healthKeys    `json:"keys"`
-	Proxies healthProxies `json:"proxies"`
-	Issues  []string      `json:"issues,omitempty"`
+	Inference string        `json:"inference"`
+	Status    string        `json:"status"`
+	Ready     bool          `json:"ready"`
+	Version   string        `json:"version"`
+	Models    healthModels  `json:"models"`
+	Keys      healthKeys    `json:"keys"`
+	Proxies   healthProxies `json:"proxies"`
+	Issues    []string      `json:"issues,omitempty"`
 }
 
 type healthModels struct {
@@ -91,9 +92,10 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	httpx.WriteJSON(w, httpStatus, healthResponse{
-		Status:  status,
-		Ready:   ready,
-		Version: buildinfo.Version,
+		Inference: "not_probed",
+		Status:    status,
+		Ready:     ready,
+		Version:   buildinfo.Version,
 		Models: healthModels{
 			Status:            modelStatus,
 			Total:             models.Total,

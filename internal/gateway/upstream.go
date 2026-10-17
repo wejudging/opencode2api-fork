@@ -61,7 +61,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 	if _, selected := debugKeyOverrideFrom(ctx); selected {
 		return resp, effectiveRoute, err
 	}
-	if err != nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
+	if err != nil || resp == nil || resp.StatusCode != http.StatusBadRequest || attempts >= g.maxTotalAttempts() {
 		return resp, effectiveRoute, err
 	}
 	origBody := resp.Body
@@ -202,7 +202,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		resp, err, used := g.doSelectedKeyUpstream(ctx, route, bodies, ids, override, attemptOffset)
 		return resp, route, used, err
 	}
-	if route.Anonymous {
+	if route.Anonymous && attempts < g.maxTotalAttempts() {
 		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
@@ -231,6 +231,9 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		keyTiers = []config.Tier{route.Tier}
 	}
 	for _, tier := range keyTiers {
+		if ctx.Err() != nil || attempts >= g.maxTotalAttempts() {
+			break
+		}
 		keyRoute := route
 		keyRoute.Tier = tier
 		keyRoute.Anonymous = false
@@ -274,8 +277,8 @@ const anonymousQuotaRetryAfter = time.Hour
 // including an HTTP error response, advances to the next upstream or proxy.
 // Only a successful response ends the anonymous phase; exhausting the proxy
 // cursor returns control to the preferred authenticated tiers. An exit-IP
-// quota window (429 with an hour-scale Retry-After) stops the sweep
-// immediately.
+// quota window stops retrying that exit, not the other exits. A request-wide
+// attempt ceiling applies across anonymous origins, keys, tiers and repair.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
@@ -286,7 +289,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	proxies := 0
 	attempts := 0
-	quotaExhausted := false
+	var cooling time.Duration
 	rawBody := bodies[config.TierZen]
 	if len(rawBody) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
@@ -303,7 +306,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	for i, baseURL := range upstreams {
 		preparedBodies[i], toolAliases[i] = prepareAnonymousBody(rawBody, protocol, isLegacyZenUpstream(baseURL))
 	}
-	for proxies < limit {
+	for proxies < limit && attemptOffset+attempts < g.maxTotalAttempts() {
 		if ctx.Err() != nil {
 			// The request-level budget is already gone. Stop scanning instead
 			// of firing attempts that cannot succeed and then recording them
@@ -318,9 +321,19 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			break
 		}
 		proxies++
+		lease, wait := g.claimFreeExit(ctx, route.ID, node.proxy)
+		if wait > 0 {
+			cooling = minCooldown(cooling, wait)
+			continue
+		}
+		defer lease.finish(nil, context.Canceled)
 		var nodeResp *http.Response
 		var nodeErr error
+		originsTried := 0
 		for index, baseURL := range upstreams {
+			if attemptOffset+attempts >= g.maxTotalAttempts() {
+				break
+			}
 			if ctx.Err() != nil {
 				if lastErr == nil && lastResponse == nil {
 					lastErr = ctx.Err()
@@ -328,6 +341,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			}
 			attempts++
+			originsTried++
 			if meta := telemetry.MetaFromContext(ctx); meta != nil {
 				meta.Attempts = attemptOffset + attempts
 				meta.Tier = string(config.TierZen)
@@ -361,6 +375,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			nodeResp, nodeErr = resp, err
 			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 			if err == nil && resp.StatusCode/100 == 2 {
+				lease.finish(resp, nil)
 				g.observeAnonymousResult(ctx, node, resp, nil)
 				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 				return resp, nil, attempts
@@ -375,14 +390,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			} else {
 				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			}
-			// An exit-IP free-tier quota answers with a Retry-After measured in
-			// hours and every configured exit resets in the same window, so
-			// sweeping the remaining proxies only re-sends the same rate-limit
-			// (observed as 8-11 identical 429s per request). Stop the whole
-			// anonymous phase and let the key tiers and the client's own
-			// Retry-After backoff take over.
+			// A shared reset time is not evidence that other exits are exhausted.
+			// Skip this exit's second origin, then continue within the total budget.
 			if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests && parseRetryAfter(resp.Header.Get("Retry-After")) >= anonymousQuotaRetryAfter {
-				quotaExhausted = true
 				break
 			}
 			if index+1 < len(upstreams) && !node.proxy.healthy.Load() {
@@ -392,13 +402,21 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		if ctx.Err() != nil {
 			break
 		}
-		g.observeAnonymousResult(ctx, node, nodeResp, nodeErr)
-		if quotaExhausted {
-			break
+		if nodeErr == nil && nodeResp != nil && nodeResp.StatusCode == http.StatusForbidden && originsTried < len(upstreams) {
+			// A request budget, not the exit, prevented the alternate-origin
+			// check. Do not turn a legacy-only rejection into a 12h ban.
+			lease.finish(nil, context.Canceled)
+		} else {
+			lease.finish(nodeResp, nodeErr)
 		}
+		g.observeAnonymousResult(ctx, node, nodeResp, nodeErr)
 	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
+	}
+	if cooling > 0 {
+		setRequestCredential(ctx, config.TierZen, "", "cooldown", true, nil)
+		return freeCooldownResponse(cooling), nil, attempts
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no healthy anonymous proxies available")
@@ -961,6 +979,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
+	var cooling time.Duration
 	nodes := g.zenNodes
 	baseURL := g.cfg.Upstream.Zen
 	if route.Tier == config.TierGo {
@@ -968,7 +987,8 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		baseURL = g.cfg.Upstream.Go
 	}
 	cursor := nodes.CursorFor(ids.Session)
-	if g.catalog.IsFreeModel(route.ID) {
+	free := g.catalog.IsFreeModel(route.ID)
+	if free {
 		// A free-tier quota is scoped to the exit IP and every key is bound to
 		// its own proxy, so pinning free-model traffic to one session key
 		// exhausts a single exit while the rest sit idle. Rotate instead so the
@@ -991,7 +1011,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		meta.Shaped = changed
 		meta.ToolAlias = alias
 	}
-	for attempts < g.cfg.Retry.MaxAttempts {
+	for scanned := 0; scanned < max(nodes.Len(), g.cfg.Retry.MaxAttempts) && attempts < g.cfg.Retry.MaxAttempts && attemptOffset+attempts < g.maxTotalAttempts(); scanned++ {
 		if ctx.Err() != nil {
 			// Same guard as the anonymous loop: an exhausted request budget
 			// must not be spent rotating keys that were never really tried.
@@ -1003,6 +1023,21 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		node := cursor.Next()
 		if node == nil {
 			break
+		}
+		proxy := nodes.Proxy(node)
+		if proxy == nil {
+			lastErr = errors.New("upstream key has no proxy binding")
+			break
+		}
+		var lease *freeExitLease
+		if free {
+			var wait time.Duration
+			lease, wait = g.claimFreeExit(ctx, route.ID, proxy)
+			if wait > 0 {
+				cooling = minCooldown(cooling, wait)
+				continue
+			}
+			defer lease.finish(nil, context.Canceled)
 		}
 		attempts++
 		// Keep the request-level trace synchronized with the attempt that is
@@ -1018,11 +1053,6 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key)
 		if err != nil {
 			return nil, err, attempts
-		}
-		proxy := nodes.Proxy(node)
-		if proxy == nil {
-			lastErr = errors.New("upstream key has no proxy binding")
-			break
 		}
 		if proxy.pool {
 			req.Close = true
@@ -1043,7 +1073,16 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			}
 			break
 		}
-		g.observeKeyResult(ctx, nodes, node, proxy, resp, err)
+		lease.finish(resp, err)
+		if free && isFreeExitRestriction(resp, err) {
+			// Exit quota/ban is not an account failure. Paid models using the
+			// same key must remain available; both free lanes share the ledger.
+			if !isDiagnosticRequest(ctx) {
+				g.syncProxyResult(ctx, proxy, upstreamStatus(resp), err)
+			}
+		} else {
+			g.observeKeyResult(ctx, nodes, node, proxy, resp, err)
+		}
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, proxy, resp, err, attemptDuration)
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", config.RedactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
@@ -1067,6 +1106,10 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
+	}
+	if cooling > 0 {
+		setRequestCredential(ctx, route.Tier, "", "cooldown", false, nil)
+		return freeCooldownResponse(cooling), nil, attempts
 	}
 	return nil, lastErr, attempts
 }

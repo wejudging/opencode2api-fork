@@ -44,6 +44,7 @@ type RuntimeManager struct {
 	updateMu           sync.Mutex
 	effective          effectiveListeners
 	metadata           *modelcatalog.PricingStore
+	freeExits          *freeExitStore
 	availabilityCancel context.CancelFunc
 }
 
@@ -59,6 +60,15 @@ func NewRuntimeManager(root context.Context, configPath string, cfg config.Confi
 		effective: effectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled},
 	}
 	manager.metadata = modelcatalog.NewPricingStore(configPath, logger)
+	statePath := ""
+	if configPath != "" {
+		statePath = configPath + ".free-exits.json"
+	}
+	var stateErr error
+	manager.freeExits, stateErr = newFreeExitStore(statePath, logger)
+	if stateErr != nil {
+		return nil, fmt.Errorf("load free exit state: %w", stateErr)
+	}
 	// models.dev refreshes ride the active runtime's healthy proxy transports
 	// and fall back to the store's direct client when none are available.
 	manager.metadata.SetClientProvider(func() []*http.Client {
@@ -122,6 +132,7 @@ func (m *RuntimeManager) build(cfg config.Config) (*gatewayRuntime, error) {
 		return nil, err
 	}
 	gateway.rotation = m.rotation
+	gateway.freeExits = m.freeExits // Shared across Apply, Reload and in-flight old runtimes.
 	availabilityPath := ""
 	if m.configPath != "" {
 		availabilityPath = m.configPath + "." + config.Fingerprint(cfg.Upstream.Zen) + ".availability.json"
@@ -289,6 +300,7 @@ func (m *RuntimeManager) Shutdown() {
 }
 
 type ResourceSnapshot struct {
+	FreeExits []freeExitState               `json:"free_exits"`
 	Models    modelcatalog.CatalogSnapshot  `json:"models"`
 	Keys      []KeyStatus                   `json:"keys"`
 	Proxies   []ProxyStatus                 `json:"proxies"`
@@ -323,6 +335,7 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	gateway := runtime.gateway
 	_, models := gateway.availableModels()
 	result := ResourceSnapshot{Models: models, Anonymous: gateway.cfg.Anonymous}
+	result.FreeExits = gateway.freeExits.snapshot()
 	result.Metadata = gateway.catalog.MetadataSnapshot()
 	result.Keys = append(result.Keys, keyStatuses("zen", gateway.zenNodes)...)
 	result.Keys = append(result.Keys, keyStatuses("go", gateway.goNodes)...)

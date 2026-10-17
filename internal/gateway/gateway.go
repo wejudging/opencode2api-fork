@@ -53,6 +53,7 @@ type Gateway struct {
 	zenNodes     *nodePool
 	goNodes      *nodePool
 	anonymous    *anonymousPool
+	freeExits    *freeExitStore
 	catalog      *models.Catalog
 	monitor      *telemetry.Monitor
 	availability *models.AvailabilityStore
@@ -83,6 +84,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 	catalog := models.NewCatalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
+	freeExits, _ := newFreeExitStore("", logger)
 	return &Gateway{
 		cfg:            cfg,
 		rotation:       rotationManager,
@@ -91,6 +93,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		zenNodes:       zenNodes,
 		goNodes:        goNodes,
 		anonymous:      newAnonymousPool(cfg.Anonymous, transports, cooldown),
+		freeExits:      freeExits,
 		catalog:        catalog,
 		monitor:        monitor,
 		attemptTimeout: attemptDeadline(cfg),

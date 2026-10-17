@@ -13,6 +13,7 @@
   },
   "retry": {
     "max_attempts": 3,
+    "max_total_attempts": 6,
     "timeout_seconds": 300
   },
   "models": {

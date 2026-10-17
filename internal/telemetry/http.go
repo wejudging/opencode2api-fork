@@ -12,11 +12,12 @@ import (
 )
 
 type RequestMeta struct {
-	ModelAlias string
-	Model      string
-	Tier       string
-	Protocol   protocol.Protocol
-	Request    string
+	FirstEventMS int64
+	ModelAlias   string
+	Model        string
+	Tier         string
+	Protocol     protocol.Protocol
+	Request      string
 	// Session is the canonical upstream session (ses_...). All turns of one
 	// conversation share it, so per-session token burn is visible in logs
 	// and monitoring: every session draws from the same upstream IP bucket
@@ -128,11 +129,15 @@ func Middleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.H
 				outcome = requestOutcome(status, meta.Channel)
 			}
 			if meta.Channel != "" {
-				logger.Info("request routed", "component", "http", "event", "request_routed", "method", r.Method,
+				level := slog.LevelInfo
+				if (status >= 400 || outcome == "stream_error") && outcome != "client_canceled" {
+					level = slog.LevelWarn
+				}
+				logger.Log(r.Context(), level, "request routed", "component", "http", "event", "request_routed", "method", r.Method,
 					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "request_id", meta.Request,
 					"model", meta.Model, "model_alias", meta.ModelAlias, "session", meta.Session, "server_key_id", meta.ServerKeyID, "tier", meta.Tier, "key_id", meta.KeyID,
 					"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "legs", strings.Join(meta.Legs, " "), "stream", meta.Stream, "outcome", outcome,
-					"stop", meta.Stop, "in", meta.Usage.Input, "out", meta.Usage.Output, "reasoning_tokens", meta.Usage.Reasoning, "cached", meta.Usage.Cached, "tail", meta.Tail)
+					"first_event_ms", meta.FirstEventMS, "stop", meta.Stop, "in", meta.Usage.Input, "out", meta.Usage.Output, "reasoning_tokens", meta.Usage.Reasoning, "cached", meta.Usage.Cached, "tail", meta.Tail)
 			}
 			logger.Debug("request completed", "component", "http", "event", "request_complete", "method", r.Method,
 				"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,

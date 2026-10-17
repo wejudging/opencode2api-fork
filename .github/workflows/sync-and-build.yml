@@ -8,7 +8,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-and-build
@@ -20,8 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      sha: ${{ steps.merge.outputs.sha }}
     steps:
       - name: Merge upstream into main
+        id: merge
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -30,17 +33,44 @@ jobs:
             exit 1
           }
           echo "${response}"
+          echo "sha=$(gh api repos/${GITHUB_REPOSITORY}/commits/main --jq .sha)" >> "$GITHUB_OUTPUT"
 
-  build:
+  verify:
     needs: [sync]
     if: always() && (needs.sync.result == 'success' || needs.sync.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      short: ${{ steps.source.outputs.short }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha || github.sha }}
+      - id: source
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify exact source before publication
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
+          go build ./...
+
+  build:
+    needs: [verify]
+    if: always() && needs.verify.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.verify.outputs.sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -60,7 +90,10 @@ jobs:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/opencode2api
           tags: |
             type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=sha-${{ needs.verify.outputs.short }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.verify.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.short }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -70,5 +103,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

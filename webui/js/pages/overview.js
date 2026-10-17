@@ -101,6 +101,14 @@ function renderResources(resources) {
       ]),
     );
   });
+  (resources.free_exits || []).forEach((state) => {
+    const active = new Date(state.until).getTime() > Date.now();
+    keys.append(el("tr", {}, [
+      el("td", { text: `${state.model} · ${state.id.slice(0, 10)}` }),
+      el("td", { text: `free/${state.reason}` }),
+      el("td", { class: "status warn", text: state.probing ? "复探中 / probing" : active ? `冷却至 ${new Date(state.until).toLocaleString()}` : "待单次复探 / probe due" }),
+    ]));
+  });
   if (!keys.children.length) emptyRow(keys, 3);
 }
 
@@ -112,6 +120,7 @@ function renderBreakdowns(metrics) {
     [t("状态码", "breakdown.status"), metrics.statuses],
     [t("模型", "breakdown.model"), metrics.models],
     ["Tier", metrics.tiers],
+    ["终态 / outcome", metrics.outcomes],
   ].forEach(([title, data]) => {
     const body = el("tbody");
     Object.entries(data || {})
@@ -134,6 +143,7 @@ function renderSummary(monitor) {
   const metrics = monitor.metrics;
   $("#m-total").textContent = formatNumber(metrics.last_hour.total);
   $("#m-rate").textContent = `${((metrics.last_hour.success_rate || 0) * 100).toFixed(1)}%`;
+  $("#m-rate").title = `排除客户端取消 / excludes client cancellation: ${metrics.last_hour.client_canceled || 0}`;
   $("#m-p95").textContent = `${metrics.last_hour.p95_ms || 0} ms`;
   $("#m-active").textContent = `${metrics.active_requests || 0} / ${metrics.active_streams || 0}`;
   renderResources(monitor.resources);

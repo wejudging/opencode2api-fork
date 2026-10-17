@@ -15,7 +15,8 @@ services:
       WEBUI_LISTEN_ADDRESS: ${OPENCODE2API_WEBUI_LISTEN:-}
     ports:
       - "${OPENCODE2API_PORT:-8080}:8080"
-      - "${OPENCODE2API_WEBUI_PORT:-8081}:8081"
+      # Use an SSH tunnel or a local HTTPS reverse proxy for administration.
+      - "${OPENCODE2API_WEBUI_BIND:-127.0.0.1}:${OPENCODE2API_WEBUI_PORT:-8081}:8081"
     configs:
       - source: opencode2api_config
         target: /run/config/opencode2api.json

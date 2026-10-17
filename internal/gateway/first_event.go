@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/telemetry"
 )
 
 var (
@@ -145,6 +146,10 @@ func (b *attemptBody) Close() error {
 // so a wedged exit can otherwise hang in the write or dial phase until the
 // request-level budget is gone.
 func doInferenceAttempt(client *http.Client, req *http.Request, firstEventTimeout, attemptTimeout time.Duration) (*http.Response, error) {
+	started := time.Now()
+	if meta := telemetry.MetaFromContext(req.Context()); meta != nil {
+		meta.FirstEventMS = 0
+	}
 	if (firstEventTimeout <= 0 && attemptTimeout <= 0) || strings.HasSuffix(req.URL.Path, "/systemone") {
 		return client.Do(req)
 	}
@@ -231,6 +236,9 @@ func doInferenceAttempt(client *http.Client, req *http.Request, firstEventTimeou
 		return nil, &phasedError{err: cause, phase: trace.phase()}
 	}
 	resp.Body = &attemptBody{Reader: io.MultiReader(bytes.NewReader(prefix), reader), body: resp.Body, cancel: cancel}
+	if meta := telemetry.MetaFromContext(req.Context()); meta != nil {
+		meta.FirstEventMS = max(1, time.Since(started).Milliseconds())
+	}
 	return resp, nil
 }
 

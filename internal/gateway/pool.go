@@ -102,10 +102,8 @@ func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 // Next visits each healthy, non-cooling static proxy at most once per cursor.
 // When the pool contains rotating proxy-pool transports (#pool), it continues
 // cycling through them after the first pass so retry.max_attempts can draw a
-// fresh upstream connection (and new exit IP) on every attempt. If all static
-// proxies are currently cooling or marked unhealthy, Next falls back to the
-// earliest-expiring node not yet tried by this cursor instead of returning nil
-// immediately.
+// fresh upstream connection (and new exit IP) on every attempt. Static exits
+// that are cooling/unhealthy are NEVER selected as an earliest-expiry fallback.
 func (c *anonymousCursor) Next() *anonymousNode {
 	if c.pool == nil || len(c.pool.nodes) == 0 {
 		return nil
@@ -133,25 +131,6 @@ func (c *anonymousCursor) Next() *anonymousNode {
 				return node
 			}
 		}
-	}
-	choice := -1
-	var earliest int64
-	choiceHealthy := false
-	for step := range n {
-		idx := (c.start + step) % n
-		if c.used[idx] {
-			continue
-		}
-		node := c.pool.nodes[idx]
-		healthy := node.proxy.healthy.Load()
-		until := node.cooldownUntil.Load()
-		if choice < 0 || (healthy && !choiceHealthy) || (healthy == choiceHealthy && until < earliest) {
-			choice, earliest, choiceHealthy = idx, until, healthy
-		}
-	}
-	if choice >= 0 {
-		c.used[choice] = true
-		return c.pool.nodes[choice]
 	}
 	return nil
 }
@@ -196,14 +175,6 @@ func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 // recovers first.
 const maxAnonymousRetryAfterMultiplier = 8
 
-// blockedExitCooldown sidelines an anonymous exit whose egress IP the free
-// tier rejects with 403. The rejection is exit-specific (the identical shaped
-// request succeeds through other exits on both the legacy /zen/v1 and the
-// /inference lane) and persists across the normal cooldown window, so a short
-// cooldown only re-probed the flagged exits on every idle period and wasted
-// two attempts per exit before reaching a working one.
-const blockedExitCooldown = 12 * time.Hour
-
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
 	if node == nil || (node.proxy != nil && node.proxy.pool) {
 		return
@@ -211,9 +182,8 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 		return
 	}
-	if resp != nil && resp.StatusCode == http.StatusForbidden {
-		node.failures.Store(0)
-		node.cooldownUntil.Store(time.Now().Add(blockedExitCooldown).UnixNano())
+	// Inference bans/daily quotas live in freeExitStore, not transport health.
+	if isFreeExitRestriction(resp, err) {
 		return
 	}
 	failures := node.failures.Add(1)

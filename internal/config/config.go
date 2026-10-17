@@ -61,8 +61,9 @@ type UpstreamConfig struct {
 }
 
 type RetryConfig struct {
-	MaxAttempts    int `json:"max_attempts"`
-	TimeoutSeconds int `json:"timeout_seconds"`
+	MaxAttempts      int `json:"max_attempts"`
+	MaxTotalAttempts int `json:"max_total_attempts,omitempty"`
+	TimeoutSeconds   int `json:"timeout_seconds"`
 }
 
 type ModelsConfig struct {
@@ -199,6 +200,12 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
+	}
+	if cfg.Retry.MaxTotalAttempts == 0 {
+		cfg.Retry.MaxTotalAttempts = 6
+	}
+	if cfg.Retry.MaxTotalAttempts < 1 || cfg.Retry.MaxTotalAttempts > 64 {
+		return Config{}, errors.New("retry.max_total_attempts must be between 1 and 64")
 	}
 	if cfg.Retry.TimeoutSeconds < 1 {
 		return Config{}, errors.New("retry.timeout_seconds must be at least 1")
