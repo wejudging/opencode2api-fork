@@ -215,7 +215,7 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 2. 按 `prefer` 顺序尝试认证通道，仅包含已配置 Key 且可以提供该模型的 Tier。
 3. 每个认证 Tier 分别使用 `retry.max_attempts` 预算。
 
-所有普通路由阶段（含匿名双通道、Key/Tier 回退与 reasoning 修复）共享 `retry.max_total_attempts` 总次数上限，默认 6，并共享请求总超时；`retry.max_attempts` 仍是每个认证 Tier 的局部上限。出口每日额度与封禁按出口/模型隔离并持久化，不能由单个出口的 429 推断全池耗尽。网络错误、认证失败、限流和服务端错误可以触发 Key 轮换；其他 4xx 会结束当前 Tier，仍可继续尝试另一个可用 Tier。详见 [Fork 加固说明](docs/fork-hardening.md)。
+所有普通路由阶段（含匿名双通道、Key/Tier 回退与 reasoning 修复）共享 `retry.max_total_attempts` 普通尝试预算，默认 6，并共享请求总超时；`retry.max_attempts` 是每个认证 Tier 的局部预算。免费模型的不同静态出口每次首次返回 429 时退还一次预算，让请求能检查完整出口池，不再只检查前 6 个。该出口/模型冷却至“响应后 12 小时”和“下次 UTC 00:00（北京时间 08:00）额度重置”中较早者；403 封禁仍独立冷却 12 小时。只有全部路由候选都有有效 429 记录才报告全池 429；网络异常、403 或未验证出口不算额度耗尽。不能因单个出口 429 推断全池失败。详见 [Fork 加固说明](docs/fork-hardening.md)。
 
 每个 Tier 使用自己的原生协议编码请求。启用 `performance.first_event_timeout_seconds` 后，会先等待完整的 SSE data 事件再向客户端交付响应；注释心跳不算首事件。首事件前超时或断开会沿用现有 Key / 代理重试预算，交付后不再重放。默认 `0` 关闭，可对接受请求后无事件的上游尝试设置为 `15` 秒。它限制首事件而非首个文本 token，不适用于 System One；轮转别名使用独立的 `rotation.first_output_seconds`。识别到过期的 Responses reasoning 引用时，可执行一次修复重试；指定 Key 的诊断不会执行该重试。
 

@@ -130,7 +130,11 @@ func TestForbiddenAndQuotaPersistAcrossDiscoveryAndRecovery(t *testing.T) {
 			blockExit(g, "big-pickle", p, status)
 			g.refreshAnonymousTier(context.Background(), models.LegacyZenBase)
 			g.restoreProxy(p)
-			if _, wait := g.claimFreeExit(context.Background(), "big-pickle", p); wait < 11*time.Hour {
+			want := blockedExitCooldown
+			if status == 429 {
+				want = freeQuotaCooldown(time.Now())
+			}
+			if _, wait := g.claimFreeExit(context.Background(), "big-pickle", p); wait < want-time.Second {
 				t.Fatalf("restriction erased: %s", wait)
 			}
 			if lease, wait := g.claimFreeExit(context.Background(), "other-free-model", p); lease == nil || wait != 0 {

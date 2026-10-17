@@ -521,15 +521,21 @@ func copyErrorResponse(w http.ResponseWriter, protocol wire.Protocol, resp *http
 		// The local quota response passes through the same protocol adapter as
 		// provider failures. Preserve its known, actionable code without exposing
 		// arbitrary upstream error objects or changing other error contracts.
-		if resp.StatusCode == http.StatusTooManyRequests && jsonutil.StringAt(value, "error", "code") == "free_exit_cooldown" {
+		code := jsonutil.StringAt(value, "error", "code")
+		if resp.StatusCode == http.StatusTooManyRequests && code == "free_exit_cooldown" ||
+			resp.StatusCode == http.StatusServiceUnavailable && code == "free_exit_scan_incomplete" {
 			if protocol == wire.Anthropic {
-				wire.WriteError(w, protocol, resp.StatusCode, message, "free_exit_cooldown", requestID)
+				wire.WriteError(w, protocol, resp.StatusCode, message, code, requestID)
 			} else {
 				if requestID != "" {
 					w.Header().Set("x-request-id", requestID)
 				}
+				kind := "rate_limit_error"
+				if resp.StatusCode == http.StatusServiceUnavailable {
+					kind = "service_unavailable"
+				}
 				httpx.WriteJSONStatus(w, resp.StatusCode, map[string]any{"error": map[string]any{
-					"message": message, "type": "rate_limit_error", "param": nil, "code": "free_exit_cooldown",
+					"message": message, "type": kind, "param": nil, "code": code,
 				}})
 			}
 			return

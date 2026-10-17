@@ -5,19 +5,28 @@ account health. Do not restore the old earliest-expiry anonymous fallback.
 
 ## Routing invariants
 
-- `retry.max_attempts` remains the per-key-tier limit. `retry.max_total_attempts`
-  defaults to **6** and caps all inference attempts across anonymous origins,
-  proxies, authenticated tiers, and stale-reasoning repair for a normal request.
+- `retry.max_attempts` remains the per-key-tier ordinary-error limit.
+  `retry.max_total_attempts` defaults to **6** and caps charged attempts across
+  anonymous origins, proxies, authenticated tiers, and stale-reasoning repair.
+  **A confirmed 429 on a distinct static free-model exit refunds one attempt**
+  from both budgets, so quota-only scans visit all configured candidates, not
+  just the first six. Actual attempts still appear in telemetry. The ordinary
+  error budget and overall request timeout remain in force. A sweep can make
+  at most the ordinary budget plus one refunded 429 per distinct static exit.
   Diagnostic single-key calls remain single-attempt. Rotation aliases have
   their own existing member-selection loop; they are not a normal route.
-- A long 429 (`Retry-After >= 1h`) only exhausts the affected static exit/model.
-  Other eligible exits are tried within the total budget. The second anonymous
-  origin is skipped for that exhausted exit. An identical reset time is not
-  evidence that all exits have exhausted their quotas.
+- Every free-inference 429, including absent/short Retry-After, cools only the
+  affected static exit/model until **min(response time + 12h, next 00:00 UTC)**.
+  00:00 UTC is 08:00 Asia/Shanghai, the currently established daily reset time.
+  This is an operator policy, not a claim that every 429 is a daily-quota error.
+  It can delay recovery from a short throttle until the chosen deadline.
+  Other eligible exits are scanned; the second anonymous origin is skipped
+  for the cooling exit. Identical reset times do not prove other exits failed.
 - A final free-inference 403 sidelines that exit/model for 12h. Legacy/new
   anonymous origins are still allowed to fall back before a ban is recorded.
-  Daily quota waits honor Retry-After (bounded to seven days), rather than the
-  transient network backoff ceiling of 120s.
+  A concurrent 429 cannot shorten a live 403 ban. The daily quota reset does not
+  release 403 bans. Existing stored deadlines are not extended during rollout;
+  subsequent 429 responses use the new policy.
 - Free restrictions are shared between anonymous and key-backed free requests.
   They do not cool the account used for paid models, and model discovery or a
   successful network check cannot clear them.
@@ -29,11 +38,22 @@ account health. Do not restore the old earliest-expiry anonymous fallback.
 - This identifies a configured static exit, not its observed public NAT IP.
   Two proxy URLs sharing a public IP are not automatically deduplicated. A
   changed static proxy address/upstream configuration gets a new identity.
-  Rotating `#pool` entries opt out because one URL does not identify one exit.
+  Rotating `#pool` entries opt out because one URL does not identify one exit;
+  they never receive budget refunds and remain bounded by ordinary limits.
   Quota buckets are conservatively model-scoped until broader sharing is proven.
-- If every considered free exit is cooling, return a local 429 with
+- Return a route-level 429 only when **every configured route candidate** has
+  a live `quota` (429) restriction. An unavailable/unverified exit or a 403 ban
+  does not prove an all-429 result. Incomplete/mixed exhaustion returns 503
+  `free_exit_scan_incomplete` if the last result would otherwise be a 429;
+  other concrete upstream errors remain errors, and deadline/cancellation
+  remains timeout/cancellation rather than a previous 429. An unidentifiable
+  rotating pool cannot prove all exits exhausted and may produce this 503.
+  For anonymous routes candidates are all configured anonymous exits; for
+  key-only routes they are the exits bound to available route key tiers.
+- When every candidate has a confirmed active 429, return a local 429 with
   `code=free_exit_cooldown` (Anthropic: `error.type=free_exit_cooldown`) and
-  Retry-After, with zero upstream attempts. The client protocol adapter must
+  Retry-After pointing to the earliest stored deadline. Later requests make
+  zero upstream attempts until a deadline expires. The client adapter must
   preserve this classification rather than replace it with `upstream_error`.
 - Corrupt/unreadable persisted restriction state fails startup explicitly;
   back it up before repair. Do not silently discard long bans on parse errors.
@@ -73,4 +93,7 @@ Run `go vet ./...` and `go test -race ./...`. Gateway tests cover hard cooldown
 selection, independent exits, cross-key sharing, paid-route isolation,
 persistence, single half-open admission, cancellation, stale successes, runtime
 rebuilds, global budgets, first-event timing, established streams, and native
-Google endpoints. All tests use local or in-memory upstreams, never paid APIs.
+Google endpoints, seventh/eleventh-exit success, exhaustive eleven-exit 429,
+known-quota skipping, mixed failures, paid-model budget isolation, and UTC
+midnight/12-hour cooldown boundaries. All tests use local or in-memory
+upstreams, never paid APIs.

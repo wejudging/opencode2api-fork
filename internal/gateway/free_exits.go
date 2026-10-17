@@ -20,6 +20,14 @@ import (
 
 const blockedExitCooldown = 12 * time.Hour
 
+// OpenCode's free daily quota resets at 00:00 UTC (08:00 Asia/Shanghai).
+// Every free-exit 429 cools that model for at most 12h, but never past reset.
+func freeQuotaCooldown(now time.Time) time.Duration {
+	utc := now.UTC()
+	reset := time.Date(utc.Year(), utc.Month(), utc.Day()+1, 0, 0, 0, 0, time.UTC)
+	return min(blockedExitCooldown, reset.Sub(now))
+}
+
 // Free inference restrictions are independent of transport/key health. The
 // scope is upstream configuration + static proxy identity + model, shared by
 // anonymous and authenticated free lanes. Never persist proxy credentials.
@@ -126,21 +134,28 @@ func (l *freeExitLease) finish(resp *http.Response, err error) {
 		}
 		delay := time.Duration(0)
 		reason := ""
+		observedAt := time.Now()
 		if err == nil && resp != nil {
 			if resp.StatusCode == http.StatusForbidden {
 				delay, reason = blockedExitCooldown, "forbidden"
 			}
 			if resp.StatusCode == http.StatusTooManyRequests {
-				if retry := parseRetryAfter(resp.Header.Get("Retry-After")); retry >= anonymousQuotaRetryAfter {
-					delay, reason = min(retry, 7*24*time.Hour), "quota"
-				}
+				delay, reason = freeQuotaCooldown(observedAt), "quota"
 			}
 		}
 		changed := false
 		if delay > 0 {
-			until := time.Now().Add(delay)
+			until := observedAt.Add(delay)
 			if state != nil && state.Until.After(until) {
 				until = state.Until
+			}
+			if reason == "quota" && state != nil && state.Reason == "forbidden" && state.Until.After(observedAt) {
+				// A concurrent quota response cannot downgrade a live 403 ban.
+				reason = "forbidden"
+			}
+			if reason == "quota" {
+				// A concurrent older response must not push a quota past reset.
+				until = minTime(until, observedAt.Add(freeQuotaCooldown(observedAt)))
 			}
 			s.next++
 			s.entries[l.id] = &freeExitState{ID: l.id, Model: l.model, Reason: reason, Until: until, generation: s.next}
@@ -230,7 +245,14 @@ func minCooldown(current, candidate time.Duration) time.Duration {
 
 func isFreeExitRestriction(resp *http.Response, err error) bool {
 	return err == nil && resp != nil && (resp.StatusCode == http.StatusForbidden ||
-		resp.StatusCode == http.StatusTooManyRequests && parseRetryAfter(resp.Header.Get("Retry-After")) >= anonymousQuotaRetryAfter)
+		resp.StatusCode == http.StatusTooManyRequests)
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 func (g *Gateway) maxTotalAttempts() int {
