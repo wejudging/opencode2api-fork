@@ -25,12 +25,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main \
-            && echo "synced main" || echo "already up to date"
+          response=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main 2>&1) || {
+            echo "::error::upstream merge failed (resolve branch conflicts, then re-run): ${response}"
+            exit 1
+          }
+          echo "${response}"
 
   build:
     needs: [sync]
-    if: always()
+    if: always() && (needs.sync.result == 'success' || needs.sync.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: read
